@@ -1,0 +1,137 @@
+# Home Assistant package: stop BYD charging from HA (no wallbox integration needed)
+# Requires the custom integration https://github.com/jkaberg/hass-byd-vehicle
+#
+# Replace before use:
+#   YOUR_BYD_DEVICE_ID            -> device id of the car (Settings > Devices > BYD > URL)
+#   *_byd_*  entity ids below     -> your own entity ids (they depend on the car name)
+#   notify.YOUR_PHONE             -> your notify service (or delete the notify steps)
+#
+# How it works: the car has no "stop charging" command. It does stop within
+# ~20-60 s when the on-board charging schedule is rewritten so that
+#   * the window START is in the future,
+#   * the window END is in the past,
+#   * the schedule is ENABLED and set to a single (non-repeating) run.
+
+input_boolean:
+  byd_charge_guard:
+    name: BYD charge guard
+    icon: mdi:shield-car
+  byd_charge_now:
+    name: BYD charge now (guard off until unplugged)
+    icon: mdi:ev-plug-type2
+
+script:
+  byd_stop_charging:
+    alias: BYD - stop charging
+    icon: mdi:ev-station
+    mode: single
+    sequence:
+    - variables:
+        car_start: "{{ states('time.YOUR_byd_start_time')[:5] }}"
+        # A start time that already passed does NOT stop the car -> move it 12 h ahead.
+        # The car only accepts full 5-minute steps.
+        new_start: >-
+          {% set t = now() + timedelta(hours=12) %}
+          {{ car_start if car_start > now().strftime('%H:%M') else '%02d:%02d' % (t.hour, (t.minute // 5) * 5) }}
+        new_end: >-
+          {% set t = now() - timedelta(minutes=1) %}
+          {{ '%02d:%02d' % (t.hour, (t.minute // 5) * 5) }}
+    - action: byd_vehicle.save_charging_schedule
+      data:
+        device_id: YOUR_BYD_DEVICE_ID
+        start_time: "{{ new_start }}"
+        end_time: "{{ new_end }}"
+        until_full: false
+        repeat: single      # a daily schedule restarts charging on the next day
+        enabled: true       # with enabled: false the car ignores the end time
+      continue_on_error: true
+    - delay: 35
+    # "charging" in HA comes from the realtime poll - refresh, otherwise it stays "on"
+    - action: byd_vehicle.fetch_charging
+      data:
+        device_id: YOUR_BYD_DEVICE_ID
+      continue_on_error: true
+    - action: byd_vehicle.fetch_realtime
+      data:
+        device_id: YOUR_BYD_DEVICE_ID
+      continue_on_error: true
+    - delay: 15
+
+automation:
+- id: byd_charge_guard
+  alias: BYD - charge guard
+  description: Stops any charging that starts while charging is not wanted, retries until it stops.
+  mode: single
+  max_exceeded: silent
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.YOUR_byd_charging
+    from: 'off'
+    to: 'on'
+  - trigger: numeric_state
+    entity_id: sensor.YOUR_byd_battery_power
+    above: 1
+  - trigger: state
+    entity_id: binary_sensor.YOUR_byd_plug
+    to: 'on'
+  - trigger: time_pattern
+    minutes: /2
+  conditions:
+  - condition: state
+    entity_id: input_boolean.byd_charge_guard
+    state: 'on'
+  - condition: state
+    entity_id: input_boolean.byd_charge_now
+    state: 'off'
+  # plug must be in: regenerative braking also shows positive battery power
+  - condition: state
+    entity_id: binary_sensor.YOUR_byd_plug
+    state: 'on'
+  - condition: template
+    value_template: >-
+      {{ is_state('binary_sensor.YOUR_byd_charging', 'on')
+         or (trigger.platform != 'time_pattern' and states('sensor.YOUR_byd_battery_power') | float(0) > 1) }}
+  # ADD YOUR OWN CONDITION HERE: "charging is not wanted right now"
+  # (outside the cheap-tariff window, target SoC reached, ...)
+  actions:
+  - variables:
+      t0: "{{ now().timestamp() }}"
+  - repeat:
+      sequence:
+      - action: script.byd_stop_charging
+      - if:
+        - condition: template
+          value_template: >-
+            {{ not (is_state('binary_sensor.YOUR_byd_charging', 'off')
+                    and states('sensor.YOUR_byd_battery_power') | float(0) < 0.5) }}
+        then:
+        - delay: 120
+        - action: byd_vehicle.fetch_charging
+          data:
+            device_id: YOUR_BYD_DEVICE_ID
+          continue_on_error: true
+        - delay: 15
+      until:
+      - condition: template
+        value_template: >-
+          {{ (is_state('binary_sensor.YOUR_byd_charging', 'off')
+              and states('sensor.YOUR_byd_battery_power') | float(0) < 0.5)
+             or repeat.index >= 10
+             or is_state('binary_sensor.YOUR_byd_plug', 'off')
+             or is_state('input_boolean.byd_charge_now', 'on') }}
+  - action: notify.YOUR_PHONE
+    data:
+      title: >-
+        {{ 'BYD: charging stopped' if is_state('binary_sensor.YOUR_byd_charging', 'off') else 'BYD is still charging - NOT stopped' }}
+      message: "Took {{ (now().timestamp() - t0) | int }} s. Battery {{ states('sensor.YOUR_byd_soc') }}%."
+
+- id: byd_charge_now_reset
+  alias: BYD - reset "charge now" when unplugged
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.YOUR_byd_plug
+    to: 'off'
+  actions:
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.byd_charge_now
