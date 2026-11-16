@@ -1,0 +1,259 @@
+# Home Assistant package: BYD charging planner for a dynamic (hourly / 15-min) tariff
+# EXAMPLE – a cleaned-up version of what runs on our Seal U DM-i. Adapt before use.
+#
+# What it gives you (see dashboard_charging.yaml for the UI):
+#   * Mode selector:  Auto – cheapest window | Charge now | Scheduled | Off
+#   * Auto: finds the cheapest continuous window in the known prices (today + tomorrow)
+#     to reach the target %, optionally "charged by" a date and time you pick.
+#   * Charge now / Scheduled: charge to a separate target, then fall back to Auto.
+#   * binary_sensor.byd_charging_wanted – use it as the "charging not wanted" condition
+#     of the guard in ../byd_stop_charging.yaml (charging outside the plan gets stopped).
+#
+# Replace before use:
+#   sensor.YOUR_price_sensor   -> a sensor whose attributes hold price lists with items
+#                                 {start, end, value} (Nord Pool HACS: raw_today / raw_tomorrow)
+#   *_YOUR_byd_*               -> your BYD entity ids, YOUR_BYD_DEVICE_ID -> device id
+#   battery_kwh / rates below  -> your car (we measured 0.8 %/min up to 80 %, 0.6 %/min above, 11 kW AC)
+
+input_select:
+  byd_charge_mode:
+    name: BYD charge mode
+    icon: mdi:ev-station
+    options:
+    - Auto – cheapest window
+    - Charge now
+    - Scheduled
+    - "Off"
+
+input_number:
+  byd_target_auto:
+    name: BYD target in Auto
+    min: 30
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:battery-clock
+  byd_target_force:
+    name: BYD target (Charge now / Scheduled)
+    min: 20
+    max: 100
+    step: 5
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-up
+  byd_charging_losses:
+    name: BYD charging losses
+    min: 0
+    max: 25
+    step: 1
+    mode: box
+    unit_of_measurement: "%"
+
+input_datetime:
+  byd_charged_by:
+    name: BYD charged by (past = no deadline)
+    has_date: true
+    has_time: true
+    icon: mdi:clock-end
+  byd_scheduled_start:
+    name: BYD scheduled start
+    has_date: true
+    has_time: true
+    icon: mdi:clock-start
+
+template:
+- triggers:
+  - trigger: time_pattern
+    minutes: /5
+  - trigger: homeassistant
+    event: start
+  - trigger: state
+    entity_id:
+    - sensor.YOUR_byd_soc
+    - binary_sensor.YOUR_byd_plug
+    - input_select.byd_charge_mode
+    - input_number.byd_target_auto
+    - input_number.byd_charging_losses
+    - input_datetime.byd_charged_by
+    - sensor.YOUR_price_sensor
+  actions:
+  - variables:
+      battery_kwh: 18.3          # usable battery size
+      rate_low: 0.8              # % per minute below 80 %
+      rate_high: 0.6             # % per minute above 80 %
+      plan: |
+        {%- set soc = states('sensor.YOUR_byd_soc') | float(-1) -%}
+        {%- set target = states('input_number.byd_target_auto') | float(100) -%}
+        {%- set now_ts = now().timestamp() -%}
+        {#- a window that has already started is kept until it ends (new prices do not cut a session) -#}
+        {%- set pa = states.sensor.byd_charging_plan.attributes if states.sensor.byd_charging_plan is not none else {} -%}
+        {%- set changed = (trigger.entity_id if trigger is defined and trigger.entity_id is defined else '') in
+             ['input_number.byd_target_auto', 'input_datetime.byd_charged_by', 'input_select.byd_charge_mode', 'input_number.byd_charging_losses'] -%}
+        {%- if pa.get('ok') == true and (pa.get('start_ts') | int(0)) <= now_ts < (pa.get('end_ts') | int(0))
+             and is_state('binary_sensor.YOUR_byd_plug', 'on') and not changed -%}
+          {{ dict(pa, locked=true) | to_json }}
+        {%- else -%}
+          {%- set kwh_pct = battery_kwh / 100 * (1 + states('input_number.byd_charging_losses') | float(10) / 100) -%}
+          {%- set m1 = ([0, [target, 80] | min - soc] | max) / rate_low -%}
+          {%- set m2 = ([0, target - [soc, 80] | max] | max) / rate_high -%}
+          {%- set total = ((m1 + m2) | round(0, 'ceil') | int) + (5 if m1 + m2 > 0 else 0) -%}
+          {%- set e1 = rate_low * kwh_pct -%}{%- set e2 = rate_high * kwh_pct -%}
+          {%- set ns = namespace(p=[], last=0) -%}
+          {%- for x in (state_attr('sensor.YOUR_price_sensor', 'raw_today') or []) + (state_attr('sensor.YOUR_price_sensor', 'raw_tomorrow') or []) -%}
+            {%- set a = as_timestamp(x.start, 0) -%}{%- set b = as_timestamp(x.end, 0) -%}
+            {%- if b > now_ts and x.value is number -%}{%- set ns.p = ns.p + [[a, b, x.value | float]] -%}{%- set ns.last = [ns.last, b] | max -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set dl = state_attr('input_datetime.byd_charged_by', 'timestamp') | float(0) -%}
+          {%- set deadline = dl > now_ts -%}
+          {%- set horizon = [dl, ns.last] | min if deadline else ns.last -%}
+          {%- set s0 = ((now_ts / 60) | round(0, 'ceil')) * 60 -%}
+          {%- set L = total * 60 -%}
+          {%- if soc < 0 or total == 0 or ns.p | length == 0 -%}
+            {{ {'ok': false, 'reason': 'no need to charge' if total == 0 else 'no data (battery / prices)'} | to_json }}
+          {%- else -%}
+            {#- candidate starts: now, every price-slot start, every slot end minus the session length -#}
+            {%- set c = namespace(lst=[s0]) -%}
+            {%- for x in ns.p -%}
+              {%- if x[0] > s0 -%}{%- set c.lst = c.lst + [x[0]] -%}{%- endif -%}
+              {%- if x[1] - L > s0 -%}{%- set c.lst = c.lst + [x[1] - L] -%}{%- endif -%}
+            {%- endfor -%}
+            {%- set feasible = s0 + L <= horizon -%}
+            {%- set best = namespace(s=s0, cost=999999, now_cost=0) -%}
+            {%- for s in c.lst | unique | list -%}
+              {%- if (s + L <= horizon) or (not feasible and s == s0) -%}
+                {%- set a1 = s -%}{%- set b1 = s + m1 * 60 -%}{%- set b2 = b1 + m2 * 60 -%}
+                {%- set k = namespace(v=0) -%}
+                {%- for x in ns.p -%}
+                  {%- if x[1] > a1 and x[0] < b2 -%}
+                    {%- set o1 = ([0, ([x[1], b1] | min) - ([x[0], a1] | max)] | max) / 60 -%}
+                    {%- set o2 = ([0, ([x[1], b2] | min) - ([x[0], b1] | max)] | max) / 60 -%}
+                    {%- set k.v = k.v + x[2] * (o1 * e1 + o2 * e2) -%}
+                  {%- endif -%}
+                {%- endfor -%}
+                {%- if s == s0 -%}{%- set best.now_cost = k.v -%}{%- endif -%}
+                {%- if k.v < best.cost -%}{%- set best.cost = k.v -%}{%- set best.s = s -%}{%- endif -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if feasible -%}
+              {%- set start = best.s -%}{%- set end = best.s + L -%}{%- set reach = target -%}
+            {%- else -%}
+              {%- set start = s0 -%}{%- set end = horizon -%}{%- set mins = (horizon - s0) / 60 -%}
+              {%- set reach = ([target, soc + [mins, m1] | min * rate_low + ([0, mins - m1] | max) * rate_high] | min) | round(0) -%}
+            {%- endif -%}
+            {#- the car only accepts full 5-minute steps -#}
+            {%- set start = ((start / 300) | round(0, 'floor')) * 300 -%}{%- set end = ((end / 300) | round(0, 'ceil')) * 300 -%}
+            {{ {'ok': true, 'feasible': feasible,
+                'start': start | timestamp_custom('%H:%M'), 'end': end | timestamp_custom('%H:%M'),
+                'start_ts': start | int, 'end_ts': end | int, 'day': start | timestamp_custom('%a %d.%m'),
+                'minutes': ((end - start) / 60) | round(0) | int, 'kwh': ((target - soc) * kwh_pct) | round(1),
+                'cost': best.cost | round(2), 'cost_if_now': best.now_cost | round(2),
+                'target': target | int, 'reaches': reach | int,
+                'deadline': (dl | timestamp_custom('%d.%m %H:%M')) if deadline else 'none', 'locked': false} | to_json }}
+          {%- endif -%}
+        {%- endif -%}
+  sensor:
+  - name: BYD charging plan
+    unique_id: byd_charging_plan
+    icon: mdi:calendar-clock
+    state: "{% set p = plan | from_json %}{{ (p.day ~ ' ' ~ p.start ~ '–' ~ p.end) if p.ok else 'none' }}"
+    attributes:
+      ok: "{{ (plan | from_json).get('ok') }}"
+      feasible: "{{ (plan | from_json).get('feasible') }}"
+      start: "{{ (plan | from_json).get('start') }}"
+      end: "{{ (plan | from_json).get('end') }}"
+      start_ts: "{{ (plan | from_json).get('start_ts') }}"
+      end_ts: "{{ (plan | from_json).get('end_ts') }}"
+      day: "{{ (plan | from_json).get('day') }}"
+      minutes: "{{ (plan | from_json).get('minutes') }}"
+      kwh: "{{ (plan | from_json).get('kwh') }}"
+      cost: "{{ (plan | from_json).get('cost') }}"
+      cost_if_now: "{{ (plan | from_json).get('cost_if_now') }}"
+      target: "{{ (plan | from_json).get('target') }}"
+      reaches: "{{ (plan | from_json).get('reaches') }}"
+      deadline: "{{ (plan | from_json).get('deadline') }}"
+      reason: "{{ (plan | from_json).get('reason') }}"
+      locked: "{{ (plan | from_json).get('locked', false) }}"
+
+- binary_sensor:
+  - name: BYD charging wanted
+    unique_id: byd_charging_wanted
+    icon: mdi:ev-plug-type2
+    # 5 min tolerance around the planned window
+    state: >-
+      {% set mode = states('input_select.byd_charge_mode') %}
+      {% set soc = states('sensor.YOUR_byd_soc') | float(0) %}
+      {% set p = states.sensor.byd_charging_plan.attributes if states.sensor.byd_charging_plan is not none else {} %}
+      {% set t = now().timestamp() %}
+      {% if mode == 'Charge now' %}{{ soc < states('input_number.byd_target_force') | float(80) }}
+      {% elif mode == 'Scheduled' %}{{ t >= state_attr('input_datetime.byd_scheduled_start', 'timestamp') | float(0)
+                                       and soc < states('input_number.byd_target_force') | float(80) }}
+      {% elif mode == 'Auto – cheapest window' %}{{ p.get('ok') == true and (p.get('start_ts') | int(0)) - 300 <= t <= (p.get('end_ts') | int(0)) + 300
+                                                    and soc < states('input_number.byd_target_auto') | float(100) }}
+      {% else %}false{% endif %}
+
+automation:
+# Start: when charging is wanted and the car is plugged in but not charging, write a window
+# that covers "now" (start = now, rounded down to 5 min). The car starts within ~1 min.
+# Stop: done by the guard in ../byd_stop_charging.yaml (condition: binary_sensor.byd_charging_wanted is off).
+- id: byd_charging_controller
+  alias: BYD - charging controller
+  mode: single
+  max_exceeded: silent
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.byd_charging_wanted
+    to: "on"
+  - trigger: state
+    entity_id: binary_sensor.YOUR_byd_plug
+    to: "on"
+  - trigger: time_pattern
+    minutes: /5
+  conditions:
+  - condition: state
+    entity_id: binary_sensor.byd_charging_wanted
+    state: "on"
+  - condition: state
+    entity_id: binary_sensor.YOUR_byd_plug
+    state: "on"
+  - condition: state
+    entity_id: binary_sensor.YOUR_byd_charging
+    state: "off"
+  # do not hammer the car: at most one schedule write per 10 minutes
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none
+         or (now() - this.attributes.last_triggered).total_seconds() > 600 }}
+  actions:
+  - variables:
+      p_end: "{{ state_attr('sensor.byd_charging_plan', 'end') }}"
+      start: >-
+        {% set t = now() %}{{ '%02d:%02d' % (t.hour, (t.minute // 5) * 5) }}
+      end: >-
+        {% if is_state('input_select.byd_charge_mode', 'Auto – cheapest window') and p_end %}{{ p_end }}
+        {% else %}{% set t = now() + timedelta(hours=12) %}{{ '%02d:%02d' % (t.hour, (t.minute // 5) * 5) }}{% endif %}
+  - action: byd_vehicle.save_charging_schedule
+    data:
+      device_id: YOUR_BYD_DEVICE_ID
+      start_time: "{{ start }}"
+      end_time: "{{ end | trim }}"
+      until_full: false
+      repeat: single
+      enabled: true
+  - delay: 60
+  - action: byd_vehicle.fetch_charging
+    data:
+      device_id: YOUR_BYD_DEVICE_ID
+
+# Charge now / Scheduled: back to Auto once the target is reached
+- id: byd_force_target_reached
+  alias: BYD - back to Auto after Charge now / Scheduled
+  triggers:
+  - trigger: template
+    value_template: >-
+      {{ states('input_select.byd_charge_mode') in ['Charge now', 'Scheduled']
+         and states('sensor.YOUR_byd_soc') | float(0) >= states('input_number.byd_target_force') | float(80) }}
+  actions:
+  - action: input_select.select_option
+    target:
+      entity_id: input_select.byd_charge_mode
+    data:
+      option: Auto – cheapest window

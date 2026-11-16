@@ -1,0 +1,142 @@
+# Lovelace section (sections view) for the planner in charging_planner.yaml.
+# Paste into a dashboard in YAML mode under `sections:` and replace the YOUR_byd_* entity ids.
+# Tiles for the mode-specific settings only show up in the mode that uses them.
+type: grid
+cards:
+- type: heading
+  heading: Charging
+  heading_style: title
+  icon: mdi:ev-station
+- type: gauge
+  entity: sensor.YOUR_byd_soc
+  name: Battery
+  min: 0
+  max: 100
+  needle: true
+  severity:
+    red: 0
+    yellow: 30
+    green: 60
+  grid_options:
+    columns: 6
+    rows: 3
+- type: markdown
+  grid_options:
+    columns: 6
+    rows: auto
+  content: >-
+    {% set mode = states('input_select.byd_charge_mode') %}
+    {% set p = states.sensor.byd_charging_plan.attributes if states.sensor.byd_charging_plan is not none else {} %}
+    {% set dl = state_attr('input_datetime.byd_charged_by', 'timestamp') | float(0) %}
+
+    **Mode:** {{ mode }}
+
+    {% if mode == 'Auto – cheapest window' -%}
+    Charges in the **cheapest window** (today + tomorrow) to **{{ states('input_number.byd_target_auto') | int }}%**
+    {%- if dl > now().timestamp() %}, at the latest by **{{ dl | timestamp_custom('%a %d.%m %H:%M') }}**{% else %}, **no deadline**{% endif %}.
+
+    {% if p.ok %}**Plan:** {{ p.day }} **{{ p.start }}–{{ p.end }}**{{ ' 🔒' if p.locked }} · {{ p.minutes }} min · ~{{ p.kwh }} kWh
+
+    **Cost:** ~{{ '%.2f' % (p.cost | float(0)) }} (charging right now: {{ '%.2f' % (p.cost_if_now | float(0)) }})
+    {%- if p.feasible == false %}
+
+    ⚠️ **Not enough time before the deadline** – reaches about **{{ p.reaches }}%**.{% endif %}
+    {%- else %}**Plan:** {{ p.reason or 'none' }}{% endif %}
+    {%- elif mode == 'Charge now' %}Charging **now** to **{{ states('input_number.byd_target_force') | int }}%**, then back to Auto.
+    {%- elif mode == 'Scheduled' %}Starts **{{ as_timestamp(states('input_datetime.byd_scheduled_start')) | timestamp_custom('%d.%m %H:%M') }}**, charges to **{{ states('input_number.byd_target_force') | int }}%**, then back to Auto.
+    {%- else %}Charging is off.{% endif %}
+
+    **Price now:** {{ states('sensor.YOUR_price_sensor') }}
+
+    **Battery:** {{ states('sensor.YOUR_byd_soc') | int(0) }}% ·
+    {{ 'charging ⚡ ' ~ states('sensor.YOUR_byd_battery_power') ~ ' kW' if is_state('binary_sensor.YOUR_byd_charging', 'on') else 'not charging' }} ·
+    plug: {{ 'in' if is_state('binary_sensor.YOUR_byd_plug', 'on') else 'out' }}
+- type: tile
+  entity: input_select.byd_charge_mode
+  name: Charge mode
+  features:
+  - type: select-options
+  features_position: bottom
+  grid_options:
+    columns: 12
+- type: tile
+  entity: input_number.byd_target_auto
+  name: Target in Auto
+  features:
+  - type: numeric-input
+    style: slider
+  features_position: bottom
+  grid_options:
+    columns: 6
+  visibility:
+  - condition: state
+    entity: input_select.byd_charge_mode
+    state: Auto – cheapest window
+- type: tile
+  entity: input_datetime.byd_charged_by
+  name: Charged by (past date = no deadline)
+  grid_options:
+    columns: 12
+  visibility:
+  - condition: state
+    entity: input_select.byd_charge_mode
+    state: Auto – cheapest window
+- type: tile
+  entity: sensor.byd_charging_plan
+  name: Charging plan
+  icon: mdi:calendar-clock
+  grid_options:
+    columns: 12
+  visibility:
+  - condition: state
+    entity: input_select.byd_charge_mode
+    state: Auto – cheapest window
+- type: tile
+  entity: input_number.byd_target_force
+  name: Target (Charge now / Scheduled)
+  features:
+  - type: numeric-input
+    style: slider
+  features_position: bottom
+  grid_options:
+    columns: 6
+  visibility:
+  - condition: state
+    entity: input_select.byd_charge_mode
+    state:
+    - Charge now
+    - Scheduled
+- type: tile
+  entity: input_datetime.byd_scheduled_start
+  name: Scheduled start
+  grid_options:
+    columns: 12
+  visibility:
+  - condition: state
+    entity: input_select.byd_charge_mode
+    state: Scheduled
+- type: tile
+  entity: binary_sensor.YOUR_byd_charging
+  name: Charging
+  grid_options:
+    columns: 4
+- type: tile
+  entity: sensor.YOUR_byd_battery_power
+  name: Power
+  grid_options:
+    columns: 4
+- type: tile
+  entity: binary_sensor.YOUR_byd_plug
+  name: Plug
+  grid_options:
+    columns: 4
+- type: tile
+  entity: input_boolean.byd_charge_guard
+  name: Charge guard
+  grid_options:
+    columns: 6
+- type: tile
+  entity: input_boolean.byd_charge_now
+  name: Charge now (guard off until unplugged)
+  grid_options:
+    columns: 6

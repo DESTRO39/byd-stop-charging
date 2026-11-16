@@ -92,7 +92,11 @@ automation:
       {{ is_state('binary_sensor.YOUR_byd_charging', 'on')
          or (trigger.platform != 'time_pattern' and states('sensor.YOUR_byd_battery_power') | float(0) > 1) }}
   # ADD YOUR OWN CONDITION HERE: "charging is not wanted right now"
-  # (outside the cheap-tariff window, target SoC reached, ...)
+  # (outside the cheap-tariff window, target SoC reached, ...).
+  # With the planner from examples/charging_planner.yaml:
+  # - condition: state
+  #   entity_id: binary_sensor.byd_charging_wanted
+  #   state: 'off'
   actions:
   - variables:
       t0: "{{ now().timestamp() }}"

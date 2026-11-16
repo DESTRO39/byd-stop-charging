@@ -48,6 +48,23 @@ outside the cheapest hours of a dynamic tariff or after the target charge level 
 Results on our car after the last fix: 5 of 5 unwanted starts stopped, four in about 60 s and one in 210 s.
 The car takes a few hundred watt-hours at most before it stops.
 
+## Example: planner and dashboard for a dynamic tariff
+
+[`examples/`](examples) holds a cleaned-up version of the planner and dashboard we use with an hourly (dynamic) electricity tariff:
+
+- [`charging_planner.yaml`](examples/charging_planner.yaml): a package with:
+  - **Charge modes:** *Auto – cheapest window*, *Charge now*, *Scheduled*, *Off*.
+  - **Auto:** finds the cheapest continuous window in the known prices (today and tomorrow) that reaches the target %. Pick a **"charged by" date and time** and the window must end before it; if there is not enough time, the plan says how far it will get.
+  - **Charge now / Scheduled:** charge to a separate target, then switch back to Auto.
+  - **`sensor.byd_charging_plan`:** the window, kWh, the cost compared with charging right now, and whether it fits the deadline. A window that has started is kept until it ends, so new prices do not cut a session.
+  - **`binary_sensor.byd_charging_wanted`:** the condition for the guard, so anything outside the plan gets stopped.
+  - **A controller** that starts charging by writing a window covering "now" once charging is wanted and the car is plugged in.
+- [`dashboard_charging.yaml`](examples/dashboard_charging.yaml): a Lovelace section with a mode selector, sliders, the deadline picker and a plan summary. Tiles only show in the mode that uses them.
+
+The price sensor needs price lists with `start`, `end` and `value` items (for example Nord Pool from HACS: `raw_today` and `raw_tomorrow`). Charging speed and battery size are variables at the top of the planner (ours: 0.8 %/min below 80 %, 0.6 %/min above, 18.3 kWh).
+
+**Status:** the planner template was checked against our live prices and gives the same window and cost as the version we run. The controller and the dashboard are simplified from ours and have not run in this exact form. Treat them as a starting point.
+
 ## Install
 
 1. Install [hass-byd-vehicle](https://github.com/jkaberg/hass-byd-vehicle).
