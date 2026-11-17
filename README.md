@@ -72,6 +72,8 @@ The price sensor needs price lists with `start`, `end` and `value` items (for ex
 3. Replace `YOUR_BYD_DEVICE_ID`, the `YOUR_byd_*` entity ids and `notify.YOUR_PHONE`.
 4. Add your "charging not wanted" condition to the guard, restart HA, turn on `input_boolean.byd_charge_guard`.
 
+The YAML files are templates, not a drop-in integration. The generic versions here were written from the setup we run but have not run in this exact form, so test the stop script once while you watch the car before relying on the guard.
+
 ## Limits
 
 - Everything goes through the BYD cloud. If the cloud or the car's connection is down, nothing stops the car.
